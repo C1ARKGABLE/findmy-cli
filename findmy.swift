@@ -31,7 +31,8 @@ func usage() -> Never {
       findmy --selftest                   run parser self-checks
 
     OPTIONS
-      --geocode        with `detail`, also resolve lat/lon (MapKit, local)
+      --geocode        with `detail`, also resolve lat/lon and time zone
+                       (MapKit, local)
       --text           human-readable output instead of JSON
       --repair         if the UI is unreadable, or (collect) every exact
                        displayed age is over 20 min (Find My stopped
@@ -143,19 +144,81 @@ func sourceHandleKey(_ label: String) -> String? {
 func matchingRows(_ labels: [String], query: String) -> [Int] {
     let key = norm(query)
     guard !key.isEmpty else { return [] }
-    let names = labels.map { norm($0.components(separatedBy: ",")[0]) }
+    let names = labels.map { norm(rowIdentity($0)) }
     let exact = names.indices.filter { names[$0] == key }
     return exact.isEmpty ? names.indices.filter { names[$0].hasPrefix(key) } : exact
 }
 
+/// A detail lookup over one tab's labels. Only a list proven complete can say
+/// an entry is absent (moving on to the next tab) or unique.
+enum Lookup: Equatable { case found(Int), absent, ambiguous, unproven }
+func lookup(_ labels: [String], complete: Bool, query: String) -> Lookup {
+    guard complete else { return .unproven }
+    let matches = matchingRows(labels, query: query)
+    if matches.count > 1 { return .ambiguous }
+    return matches.first.map { .found($0) } ?? .absent
+}
+
 func rowText(_ fields: [String: String]) -> String? {
+    if let entity = fields["ListEntityRow"], !entity.isEmpty { return entity }
     if let compact = fields["HomeElementCell"], !compact.isEmpty { return compact }
     guard let title = fields["HomeCellTitleLabel"], !title.isEmpty else { return nil }
     return [title, fields["HomeCellSubtitleLabel"], fields["HomeCellDistance"]]
         .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ", ")
 }
 
+/// Find My 5 (macOS 27) joins a row's fields with "\u{00A0}· ", distance before
+/// place: "Jane Doe · 31 mi · San Francisco, CA · 7 min. ago". A bare middle dot
+/// is not a separator ("Paral·lel").
+let dottedSeparator = #"\s\x{00B7}\s"#
+func dottedFields(_ raw: String) -> [String]? {
+    guard raw.range(of: dottedSeparator, options: .regularExpression) != nil else { return nil }
+    return raw.replacingOccurrences(of: dottedSeparator, with: "\u{1F}", options: .regularExpression)
+        .components(separatedBy: "\u{1F}").map { $0.trimmingCharacters(in: .whitespaces) }
+}
+
+/// Any field but the name can be missing, so the others are told apart by shape.
+func parseDotted(_ raw: String, _ fields: [String]) -> [String: Any] {
+    var row: [String: Any] = ["raw": raw]
+    let name = fields[0]
+    row["name"] = name
+    if let key = sourceHandleKey(name) { row["source_handle_key"] = key }
+    var loc: [String] = []
+    for field in fields.dropFirst() where !field.isEmpty {
+        if row["distance"] == nil && (field == "Nearby" || rxMatch(distRE, field)) {
+            row["distance"] = field
+        } else if field == "Paused" {
+            row["source_state"] = "paused"
+        } else if field.hasPrefix("Shared with ") {
+            row["shared"] = field
+        } else if row["when"] == nil && rxMatch(whenRE, field) {
+            row["when"] = field
+        } else {
+            loc.append(field)
+        }
+    }
+    setLocation(&row, loc.joined(separator: ", "))
+    return row
+}
+
+func setLocation(_ row: inout [String: Any], _ loc: String) {
+    switch loc.lowercased() {
+    case "can see your location":
+        row["source_state"] = "not_shared"
+    case "locating\u{2026}", "locating...":
+        row["source_state"] = "unknown"
+    case "address unavailable", "no location found", "location not available":
+        row["source_state"] = "unavailable"
+    case "":
+        if row["source_state"] == nil { row["source_state"] = "unknown" }
+    default:
+        row["location"] = loc
+        if row["source_state"] == nil { row["source_state"] = "available" }
+    }
+}
+
 func parse(_ raw: String) -> [String: Any] {
+    if let fields = dottedFields(raw) { return parseDotted(raw, fields) }
     var row: [String: Any] = ["raw": raw]
     var text = raw
     if let m = distTailRE.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)) {
@@ -175,19 +238,7 @@ func parse(_ raw: String) -> [String: Any] {
         row["when"] = last
         fields.removeLast()
     }
-    let loc = fields.joined(separator: ", ")
-    if loc == "Can see your location" {
-        row["source_state"] = "not_shared"
-    } else if ["Locating\u{2026}", "Locating..."].contains(loc) {
-        row["source_state"] = "unknown"
-    } else if ["Address Unavailable", "No location found", "Location Not Available"].contains(loc) {
-        row["source_state"] = "unavailable"
-    } else if !loc.isEmpty {
-        row["location"] = loc
-        if row["source_state"] == nil { row["source_state"] = "available" }
-    } else if row["source_state"] == nil {
-        row["source_state"] = "unknown"
-    }
+    setLocation(&row, fields.joined(separator: ", "))
     return row
 }
 
@@ -313,6 +364,13 @@ if wantSelftest {
     assert(matchingRows(candidates, query: "<person-1>") == [0])
     assert(matchingRows(candidates, query: "") == [])
     assert(matchingRows(candidates, query: "City 1") == [])
+    // A lookup decides only over a whole, proven list.
+    let listed = ["<person-1>, City 1, Now", "<person-2>, City 2, Now", "<person-23>, City 3, Now"]
+    assert(lookup(listed, complete: true, query: "<person-23>") == .found(2))
+    assert(lookup(listed, complete: true, query: "<person-9>") == .absent)
+    assert(lookup(listed, complete: true, query: "<person-2") == .ambiguous)
+    assert(lookup(listed, complete: false, query: "<person-1>") == .unproven)
+    assert(lookup(listed, complete: false, query: "<person-9>") == .unproven)
     let compact = rowText(["HomeElementCell":"<person-1>, City 1, Region 1, Now, 5 mi"])
     assert(compact == "<person-1>, City 1, Region 1, Now, 5 mi")
     let expanded = rowText(["HomeCellTitleLabel":"+12025550101", "HomeCellSubtitleLabel":"City 1, Region 1, Now", "HomeCellDistance":"5 mi"])
@@ -353,6 +411,33 @@ if wantSelftest {
     assert(farLive["when"] as? String == "Now" && farLive["location"] as? String == "City 8, ST")
     let live = parse("Person 3, City 2, Region 2 , Now, 5 mi")
     assert(live["source_state"] as? String == "available")
+    // Find My 5: one "\u{00A0}· "-joined label, distance before place.
+    let dot = "\u{00A0}\u{00B7} "
+    let dotted = parse("Person 1\(dot)1,710 mi\(dot)City 1, ST\(dot)4 min. ago")
+    assert(dotted["name"] as? String == "Person 1" && dotted["distance"] as? String == "1,710 mi")
+    assert(dotted["location"] as? String == "City 1, ST" && dotted["when"] as? String == "4 min. ago")
+    assert(dotted["source_state"] as? String == "available")
+    let nearby = parse("Person 2\(dot)Nearby\(dot)Place 2\(dot)Now")
+    assert(nearby["distance"] as? String == "Nearby" && nearby["location"] as? String == "Place 2")
+    let abroad = parse("Person 3\(dot)6,938 mi\(dot)City 3, Region 3, Country 3\(dot)4 min. ago")
+    assert(abroad["location"] as? String == "City 3, Region 3, Country 3")
+    let noAddress = parse("Person 4\(dot)335 mi\(dot)Address unavailable\(dot)5 min. ago")
+    assert(noAddress["source_state"] as? String == "unavailable" && noAddress["location"] == nil)
+    assert(noAddress["when"] as? String == "5 min. ago")
+    for lost in ["Person 5\(dot)No Location Found", "Person 5\(dot)No location found"] {
+        assert(parse(lost)["source_state"] as? String == "unavailable" && parse(lost)["location"] == nil)
+    }
+    let dottedPaused = parse("Person 6\(dot)10 mi\(dot)City 6, ST\(dot)Paused")
+    assert(dottedPaused["source_state"] as? String == "paused" && dottedPaused["location"] as? String == "City 6, ST")
+    assert(parse("Person 7\(dot)Can see your location")["source_state"] as? String == "not_shared")
+    assert(parse("Person 8\(dot)Paral\u{00B7}lel, City 8")["location"] as? String == "Paral\u{00B7}lel, City 8")
+    let sharedItem = parse("Item 1\(dot)Nearby\(dot)Home\(dot)8 min. ago\(dot)Shared with Person 1 and 1 more")
+    assert(sharedItem["location"] as? String == "Home" && sharedItem["shared"] as? String == "Shared with Person 1 and 1 more")
+    let dottedHandle = parse("+1 (202) 555-0101\(dot)5 mi\(dot)City 1, ST\(dot)Now")
+    assert(dottedHandle["source_handle_key"] as? String == sourceHandleKey("+12025550101"))
+    assert(rowText(["ListEntityRow": "Person 1\(dot)City 1"]) == "Person 1\(dot)City 1")
+    assert(rowIdentity("Person 1\(dot)5 mi\(dot)City 1, ST\(dot)Now") == "Person 1")
+    assert(matchingRows(["Person 1\(dot)5 mi\(dot)City 1, ST", "Person 12\(dot)City 2"], query: "Person 1") == [0])
     let collected = Date(timeIntervalSince1970: 1_800_000_000)
     let check = sourceCheck(raw: "<person-1>, City 1, Now", fields: ["HomeElementCell":"<person-1>, City 1, Now"],
                             checkedAt: collected, id: "example-check-1")
@@ -418,6 +503,24 @@ if wantSelftest {
     assert(pickAddress(["Jane Doe", "1 Infinite Loop, Cupertino, CA  95014", "Live"])
            == "1 Infinite Loop, Cupertino, CA  95014")
     assert(pickAddress(["Jane Doe", "Cupertino, CA • Now"]) == nil)
+    // Geocoder time zone: the identifier is the returned zone; abbreviation and
+    // offset are that zone's values at a chosen instant, not a measured clock.
+    let pacific = TimeZone(identifier: "America/Los_Angeles")!
+    let winterZone = timeZoneInfo(pacific, at: Date(timeIntervalSince1970: 1_800_000_000))
+    assert(winterZone["identifier"] as? String == "America/Los_Angeles")
+    assert(winterZone["abbreviation"] as? String == "PST")
+    assert(winterZone["seconds_from_gmt"] as? Int == -28_800)
+    assert(timeZoneText(winterZone) == "America/Los_Angeles (PST)")
+    var utcCalendar = Calendar(identifier: .gregorian)
+    utcCalendar.timeZone = TimeZone(identifier: "UTC")!
+    let summer = utcCalendar.date(from: DateComponents(year: 2026, month: 7, day: 15))!
+    let summerZone = timeZoneInfo(pacific, at: summer)
+    assert(summerZone["abbreviation"] as? String == "PDT")
+    assert(summerZone["seconds_from_gmt"] as? Int == -25_200)
+    let tokyo = timeZoneInfo(TimeZone(identifier: "Asia/Tokyo")!, at: summer)
+    assert(tokyo["identifier"] as? String == "Asia/Tokyo")
+    assert(tokyo["seconds_from_gmt"] as? Int == 32_400)
+    assert(tokyo["abbreviation"] != nil)
     assert(norm("Sam\u{2019}s iPhone") == "sam's iphone")
     assert(norm("Sam\u{2019}s iPhone").hasPrefix(norm("Sam's iPh")))
     // stale view: three exact ages all past the threshold; paused or vague ages never count
@@ -431,7 +534,7 @@ if wantSelftest {
     assert(uniqueByIdentity([1, 1, 2], same: ==) == [1, 2])
     assert(uniqueByIdentity([(1, "More Info"), (1, "More Info"), (2, "More Info")], same: { $0.0 == $1.0 }).map(\.0) == [1, 2])
     assert(uniqueByIdentity([Int](), same: ==).isEmpty)
-    print("selftest ok (\(cases.count + 3) parse cases + source-handle keys + enumeration + city checks + address picker + stale view)")
+    print("selftest ok (\(cases.count + 3) parse cases + source-handle keys + enumeration + city checks + address picker + time zone + stale view)")
     exit(0)
 }
 
@@ -511,8 +614,47 @@ struct SourceRow {
     }
 }
 
+/// Find My 5 rows: one AXButton per row whose description is the whole label.
+func entityRows(_ root: AXUIElement) -> [AXUIElement] {
+    var rows: [AXUIElement] = []
+    findAll(root, { sattr($0, "AXIdentifier") == "ListEntityRow" && sattr($0, "AXRole") == "AXButton" }, &rows)
+    return rows
+}
+
+func ancestry(_ el: AXUIElement, upTo root: AXUIElement) -> [AXUIElement] {
+    var chain = [el]
+    while !CFEqual(chain.last!, root), let parent = attr(chain.last!, "AXParent") { chain.append(parent as! AXUIElement) }
+    return chain
+}
+
+/// What pages the list and frames its rows. Find My 5 nests it inside the
+/// container, as the rows' nearest common ancestor; its page actions come and
+/// go with the scroll position, so they cannot pick it. Older versions page the
+/// container itself. With no rendered row (an empty or loading list) or a lone
+/// Find My 5 row, nothing here proves an edge.
+func scrollList() -> AXUIElement? {
+    guard let root = listContainer() else { return nil }
+    let rows = entityRows(root)
+    guard let first = rows.first, let last = rows.last else {
+        var cells: [AXUIElement] = []
+        findAll(root, { sattr($0, "AXIdentifier") == "HomeElementCell" }, &cells)
+        return cells.isEmpty ? nil : root
+    }
+    let lastChain = ancestry(last, upTo: root)
+    return ancestry(first, upTo: root).first { a in lastChain.contains { CFEqual($0, a) } }
+}
+
 func sourceRows() -> [SourceRow] {
     guard let root = listContainer() else { return [] }
+    let entities = entityRows(root)
+    if !entities.isEmpty {
+        return entities.compactMap { row in
+            let fields = ["ListEntityRow": sattr(row, "AXDescription") ?? ""]
+            guard let text = rowText(fields) else { return nil }
+            return SourceRow(element: row, fields: fields, text: text,
+                             checkedAt: Date(), checkID: UUID().uuidString.lowercased())
+        }
+    }
     var cells: [AXUIElement] = []
     findAll(root, { sattr($0, "AXIdentifier") == "HomeElementCell" && sattr($0, "AXRole") == "AXGroup" }, &cells)
     return cells.compactMap { cell in
@@ -602,10 +744,12 @@ func waitReady(timeout: TimeInterval) -> Bool {
 
 /// Select a tab and wait for *its own* rows. A press that silently no-ops would
 /// otherwise leave the previous tab's rows in place, to be recorded under this
-/// tab's name - a confident, wrong answer.
+/// tab's name - a confident, wrong answer. The rows shown before the press are
+/// the previous tab's, whichever tab that was.
 @discardableResult
-func selectTab(_ want: String, previousRows: [String] = []) -> [SourceRow]? {
+func selectTab(_ want: String) -> [SourceRow]? {
     guard let tab = tabNamed(want) else { return nil }
+    let previousRows = isSelected(want) ? [] : rowStrings()
     var deadline = Date().addingTimeInterval(10)
     while !isSelected(want) && Date() < deadline {
         AXUIElementPerformAction(tab, "AXPress" as CFString)
@@ -657,10 +801,16 @@ func prepare() throws {
 
 func selectedTab() -> String? { tabButtons().first { (attr($0, "AXValue") as? Int) == 1 }.map(label) }
 
+/// Return to the tab the user left selected. A single press can no-op, and the
+/// next run would then take whatever tab this one ended on as the user's.
 func restoreTab(_ original: String?) {
-    if let o = original, !isSelected(o), let t = tabNamed(o) {
+    guard let o = original, let t = tabNamed(o) else { return }
+    let deadline = Date().addingTimeInterval(5)
+    while !isSelected(o) && Date() < deadline {
         AXUIElementPerformAction(t, "AXPress" as CFString)
+        Thread.sleep(forTimeInterval: 0.6)
     }
+    if !isSelected(o) { warn("could not return Find My to the \(o) tab") }
 }
 
 /// Share of visible located rows showing "Paused".
@@ -715,8 +865,14 @@ func settledRows() -> [SourceRow] {
     return last
 }
 
+/// The AX tree shows a scroll a few tenths of a second late, so a read right
+/// after the action can still be the old page. Wait, bounded, for it to change.
 func scroll(_ action: String) {
-    if let list = listContainer() { AXUIElementPerformAction(list, action as CFString) }
+    guard let list = scrollList() else { return }
+    let before = identities(sourceRows())
+    AXUIElementPerformAction(list, action as CFString)
+    let deadline = Date().addingTimeInterval(1.5)
+    while Date() < deadline && identities(sourceRows()) == before { Thread.sleep(forTimeInterval: 0.1) }
 }
 
 func frame(_ el: AXUIElement) -> CGRect? {
@@ -733,7 +889,7 @@ func frame(_ el: AXUIElement) -> CGRect? {
 /// nothing" alone is not proof - another reader scrolling the other way
 /// looks the same.
 func atListEdge(top: Bool) -> Bool {
-    guard let list = listContainer(), let box = frame(list) else { return false }
+    guard let list = scrollList(), let box = frame(list) else { return false }
     let cells = (attr(list, "AXChildren") as? [AXUIElement] ?? []).compactMap(frame)
     guard let first = cells.map(\.minY).min(), let last = cells.map(\.maxY).max() else { return false }
     return top ? first >= box.minY - 0.5 : last <= box.maxY + 0.5
@@ -751,8 +907,12 @@ func scrollToTop(maxPages: Int) -> [SourceRow]? {
         idle = identities(next) == identities(page) ? idle + 1 : 0
         page = next
     }
-    return idle >= 2 && atListEdge(top: true) ? page : nil
+    return idle >= 2 && atListEdge(top: true) && edgeStill(page) ? page : nil
 }
+
+/// The edge geometry is read after the page. A page that lagged the scroll
+/// would pair old rows with the new edge, so the rows must still be the same.
+func edgeStill(_ page: [SourceRow]) -> Bool { identities(settledRows()) == identities(page) }
 
 /// All rows of the selected tab, and whether the whole list was proven read:
 /// from a proven top, every page continuing the sequence, to a proven bottom.
@@ -767,7 +927,7 @@ func enumerateList(maxPages: Int = 100) -> (rows: [SourceRow], complete: Bool) {
         guard let added = mergePage(sequence, identities(next)) else { return (rows, false) }
         if added.isEmpty {
             idle += 1
-            if idle >= 2 { return (rows, atListEdge(top: false)) }
+            if idle >= 2 { return (rows, atListEdge(top: false) && edgeStill(next)) }
             continue
         }
         idle = 0
@@ -801,18 +961,41 @@ func pickAddress(_ texts: [String]) -> String? {
     }
 }
 
-func geocode(_ address: String) -> (Double, Double)? {
-    var result: (Double, Double)?
+/// Identifier, abbreviation and offset of a geocoder time zone at `date`.
+/// The offset is the zone's at that instant; it is not a measured clock.
+func timeZoneInfo(_ zone: TimeZone, at date: Date = Date()) -> [String: Any] {
+    var info: [String: Any] = [
+        "identifier": zone.identifier,
+        "seconds_from_gmt": zone.secondsFromGMT(for: date),
+    ]
+    if let abbreviation = zone.abbreviation(for: date) { info["abbreviation"] = abbreviation }
+    return info
+}
+
+func timeZoneText(_ info: [String: Any]) -> String {
+    let identifier = info["identifier"] as? String ?? ""
+    guard let abbreviation = info["abbreviation"] as? String else { return identifier }
+    return "\(identifier) (\(abbreviation))"
+}
+
+func geocode(_ address: String) -> (latitude: Double, longitude: Double, timeZone: [String: Any]?)? {
+    var result: (latitude: Double, longitude: Double, timeZone: [String: Any]?)?
     // The macOS 26 SDK replaces CLGeocoder; older SDKs (the Nix build) lack the replacement.
+    // Both results carry a time zone: MKMapItem.timeZone, or CLPlacemark.timeZone.
     #if compiler(>=6.2)
     guard #available(macOS 26.0, *), let req = MKGeocodingRequest(addressString: address) else { return nil }
     req.getMapItems { items, _ in
-        if let c = items?.first?.location.coordinate { result = (c.latitude, c.longitude) }
+        if let item = items?.first {
+            let c = item.location.coordinate
+            result = (c.latitude, c.longitude, item.timeZone.map { timeZoneInfo($0) })
+        }
         CFRunLoopStop(CFRunLoopGetMain())
     }
     #else
     CLGeocoder().geocodeAddressString(address) { marks, _ in
-        if let c = marks?.first?.location?.coordinate { result = (c.latitude, c.longitude) }
+        if let mark = marks?.first, let c = mark.location?.coordinate {
+            result = (c.latitude, c.longitude, mark.timeZone.map { timeZoneInfo($0) })
+        }
         CFRunLoopStop(CFRunLoopGetMain())
     }
     #endif
@@ -821,29 +1004,54 @@ func geocode(_ address: String) -> (Double, Double)? {
     return result
 }
 
+/// The selected tab's entry for `query`, decided over its whole enumerated list
+/// (only on-screen rows exist in the AX tree), then read from the page that
+/// shows it so the pressed element is a rendered one.
+func locateRow(_ query: String) -> (decision: Lookup, row: SourceRow?) {
+    var listing = enumerateList()
+    if !listing.complete { listing = enumerateList() }
+    let decision = lookup(listing.rows.map(\.text), complete: listing.complete, query: query)
+    guard case .found(let index) = decision else { return (decision, nil) }
+    let target = rowIdentity(listing.rows[index].text)
+    func onPage() -> SourceRow? { settledRows().first { rowIdentity($0.text) == target } }
+    if let row = onPage() { return (decision, row) }
+    guard scrollToTop(maxPages: 100) != nil else { return (.unproven, nil) }
+    for _ in 0..<100 {
+        if let row = onPage() { return (decision, row) }
+        scroll("AXScrollDownByPage")
+    }
+    return (.unproven, nil)
+}
+
 func detail(_ name: String) -> [String: Any] {
     var out: [String: Any] = ["query": name]
     let original = selectedTab()
+    defer { restoreTab(original) }
 
-    // Find the row in whichever tab holds it.
+    // Find the row in whichever tab holds it. A tab is passed over only when
+    // its whole list was read without a match.
     var found: SourceRow?
-    var prev: [String] = []
-    for tab in TABS {
-        if !isSelected(tab) {
-            guard let selected = selectTab(tab, previousRows: prev) else { continue }
-            prev = selected.map(\.text)
-        }
-        let candidates = sourceRows()
-        let matches = matchingRows(candidates.map(\.text), query: name)
-        if matches.count > 1 {
-            out["error"] = "ambiguous entry prefix; use an exact unique source label"
-            restoreTab(original)
+    search: for tab in TABS {
+        guard isSelected(tab) || selectTab(tab) != nil else {
+            out["error"] = "could not open the \(tab) tab"
+            out["incomplete"] = [tab]
             return out
         }
-        if let index = matches.first {
-            found = candidates[index]
+        let located = locateRow(name)
+        switch located.decision {
+        case .found:
+            found = located.row
             out["tab"] = tab
-            break
+            break search
+        case .absent:
+            continue
+        case .ambiguous:
+            out["error"] = "ambiguous entry prefix; use an exact unique source label"
+            return out
+        case .unproven:
+            out["error"] = "could not prove every row of the \(tab) tab was read"
+            out["incomplete"] = [tab]
+            return out
         }
     }
     guard let row = found else {
@@ -852,58 +1060,144 @@ func detail(_ name: String) -> [String: Any] {
     }
     out["row"] = row.record
 
-    guard AXUIElementPerformAction(row.element, "AXPress" as CFString) == .success else {
-        out["error"] = "could not select the requested source row"
-        restoreTab(original)
+    let pane = row.fields["ListEntityRow"] != nil ? detailSheet(rowIdentity(row.text)) : detailPopover(row)
+    if let error = pane.error {
+        out["error"] = error
         return out
     }
-    Thread.sleep(forTimeInterval: 2.5)
-
-    let infoButtons = uniqueByIdentity(role("AXButton").filter { label($0) == "More Info" }, same: sameElement)
-    guard infoButtons.count == 1, let info = infoButtons.first else {
-        out["error"] = "no More Info button (entry may have no location)"
-        restoreTab(original)
-        return out
-    }
-    guard AXUIElementPerformAction(info, "AXPress" as CFString) == .success else {
-        out["error"] = "could not open the requested detail"
-        restoreTab(original)
-        return out
-    }
-
-    // The card's contents show up before its container's role is AXPopover.
-    let deadline = Date().addingTimeInterval(5)
-    var popover: AXUIElement?
-    while Date() < deadline {
-        let found = uniqueByIdentity(role("AXPopover"), same: sameElement)
-        if found.count == 1 { popover = found[0]; break }
-        Thread.sleep(forTimeInterval: 0.3)
-    }
-    guard let popover else {
-        out["error"] = "no unique scoped detail pane"
-        restoreTab(original)
-        return out
-    }
-    var detailLabels: [AXUIElement] = []
-    findAll(popover, { sattr($0, "AXRole") == "AXStaticText" }, &detailLabels)
-    let texts = detailLabels.map(label).filter { !$0.isEmpty }
-    if let addr = pickAddress(texts) {
+    let texts = pane.texts
+    if let addr = pane.address {
         let clean = addr.replacingOccurrences(of: "  ", with: " ")
         out["address"] = clean
-        if wantGeocode, let (lat, lon) = geocode(clean) {
-            out["latitude"] = lat
-            out["longitude"] = lon
+        if wantGeocode, let geo = geocode(clean) {
+            out["latitude"] = geo.latitude
+            out["longitude"] = geo.longitude
+            if let zone = geo.timeZone { out["time_zone"] = zone }
         }
     } else {
         out["error"] = "no street address shown (Find My may report Unknown Location)"
     }
     out["detail_texts"] = texts
+    return out
+}
+
+typealias DetailPane = (error: String?, texts: [String], address: String?)
+
+func waitFor(_ seconds: TimeInterval, _ done: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(seconds)
+    while !done() {
+        if Date() >= deadline { return false }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    return true
+}
+
+func staticTexts(_ root: AXUIElement, _ m: (AXUIElement) -> Bool = { _ in true }) -> [AXUIElement] {
+    var out: [AXUIElement] = []
+    findAll(root, { sattr($0, "AXRole") == "AXStaticText" && m($0) }, &out)
+    return out
+}
+
+/// Before Find My 5: the selected row's map callout has a More Info button that
+/// opens a popover holding the address.
+func detailPopover(_ row: SourceRow) -> DetailPane {
+    guard AXUIElementPerformAction(row.element, "AXPress" as CFString) == .success else {
+        return ("could not select the requested source row", [], nil)
+    }
+    Thread.sleep(forTimeInterval: 2.5)
+
+    let infoButtons = uniqueByIdentity(role("AXButton").filter { label($0) == "More Info" }, same: sameElement)
+    guard infoButtons.count == 1, let info = infoButtons.first else {
+        return ("no More Info button (entry may have no location)", [], nil)
+    }
+    guard AXUIElementPerformAction(info, "AXPress" as CFString) == .success else {
+        return ("could not open the requested detail", [], nil)
+    }
+
+    // The card's contents show up before its container's role is AXPopover.
+    var popover: AXUIElement?
+    _ = waitFor(5) {
+        let found = uniqueByIdentity(role("AXPopover"), same: sameElement)
+        popover = found.count == 1 ? found[0] : nil
+        return popover != nil
+    }
+    guard let popover else { return ("no unique scoped detail pane", [], nil) }
+    let texts = staticTexts(popover).map(label).filter { !$0.isEmpty }
 
     // Leave the UI as we found it - a left-open popover breaks the next read.
     AXUIElementPerformAction(popover, "AXCancel" as CFString)
     Thread.sleep(forTimeInterval: 0.8)
-    restoreTab(original)
-    return out
+    return (nil, texts, pickAddress(texts))
+}
+
+/// The one on-screen Find My 5 row titled exactly `name`.
+func entityRow(named name: String) -> AXUIElement? {
+    guard let root = listContainer() else { return nil }
+    let matches = entityRows(root).filter { rowIdentity(sattr($0, "AXDescription") ?? "") == name }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func rowIsSelected(_ name: String) -> Bool { entityRow(named: name).map { (attr($0, "AXSelected") as? Int) == 1 } ?? false }
+
+/// A custom accessibility action ("Name:Open Details\nTarget:...") by exact name.
+func customAction(_ el: AXUIElement, _ name: String) -> String? {
+    var names: CFArray?
+    AXUIElementCopyActionNames(el, &names)
+    let found = Set((names as? [String] ?? []).filter { $0.components(separatedBy: "\n").first == "Name:" + name })
+    return found.count == 1 ? found.first : nil
+}
+
+/// Find My 5: selecting a row expands it in place, and its "Open Details"
+/// action opens a sheet titled with the row's name whose SecondaryLabel is the
+/// address. The sheet also holds Stop Sharing and Remove buttons; only its
+/// Close button is ever pressed. A selected row shows a street-level place, so
+/// a row this read selected is deselected again (a second press).
+func detailSheet(_ name: String) -> DetailPane {
+    guard let el = entityRow(named: name) else { return ("the requested source row is not unique on screen", [], nil) }
+    let wasSelected = rowIsSelected(name)
+    if !wasSelected {
+        guard AXUIElementPerformAction(el, "AXPress" as CFString) == .success, waitFor(5, { rowIsSelected(name) }) else {
+            return ("could not select the requested source row", [], nil)
+        }
+    }
+    defer {
+        // The list renders again only a moment after the sheet closes.
+        if !wasSelected, waitFor(5, { rowIsSelected(name) }), let el = entityRow(named: name) {
+            AXUIElementPerformAction(el, "AXPress" as CFString)
+        }
+        if !wasSelected && !waitFor(3, { entityRow(named: name) != nil && !rowIsSelected(name) }) {
+            warn("could not deselect the requested source row")
+        }
+    }
+    guard let selected = entityRow(named: name), let open = customAction(selected, "Open Details"),
+          AXUIElementPerformAction(selected, open as CFString) == .success else {
+        return ("no Open Details action (entry may have no location)", [], nil)
+    }
+
+    var sheet: AXUIElement?
+    _ = waitFor(5) {
+        let found = uniqueByIdentity(role("AXSheet"), same: sameElement)
+        sheet = found.count == 1 ? found[0] : nil
+        return sheet != nil
+    }
+    guard let sheet else { return ("no unique scoped detail pane", [], nil) }
+    // Leave the UI as we found it - an open sheet fails every later read.
+    defer {
+        var close: [AXUIElement] = []
+        findAll(sheet, { sattr($0, "AXIdentifier") == "Close" && sattr($0, "AXRole") == "AXButton" }, &close)
+        if close.count == 1 { AXUIElementPerformAction(close[0], "AXPress" as CFString) }
+        if !waitFor(5, { role("AXSheet").isEmpty }) { warn("could not close the Find My details sheet") }
+    }
+
+    func titles() -> [String] {
+        var heads: [AXUIElement] = []
+        findAll(sheet, { sattr($0, "AXIdentifier") == "PrimaryLabel" }, &heads)
+        return heads.flatMap { staticTexts($0) }.map(label)
+    }
+    guard waitFor(5, { titles() == [name] }) else { return ("detail pane is not the requested entry's", [], nil) }
+    let texts = staticTexts(sheet).map(label).filter { !$0.isEmpty }
+    let secondary = staticTexts(sheet) { sattr($0, "AXIdentifier") == "SecondaryLabel" }.map(label)
+    return (nil, texts, secondary.count == 1 ? pickAddress(secondary) : nil)
 }
 
 // MARK: - Run
@@ -916,9 +1210,8 @@ func snapshot(_ wanted: [String]) -> [String: Any] {
     var result: [String: Any] = ["fetched_at": iso.string(from: Date())]
     let original = selectedTab()
     var bad: [String] = []
-    var prev: [String] = []
     for tab in wanted {
-        var got = selectTab(tab, previousRows: prev)
+        var got = selectTab(tab)
         if got == nil {
             // Back-to-back invocations can catch the UI mid-transition. Bounce
             // to another tab to force a clean re-render, then try once more.
@@ -926,7 +1219,7 @@ func snapshot(_ wanted: [String]) -> [String: Any] {
                 AXUIElementPerformAction(t, "AXPress" as CFString)
                 Thread.sleep(forTimeInterval: 1.5)
             }
-            got = selectTab(tab, previousRows: [])
+            got = selectTab(tab)
         }
         guard got != nil else {
             bad.append(tab)
@@ -939,7 +1232,6 @@ func snapshot(_ wanted: [String]) -> [String: Any] {
         if !listing.complete { listing = enumerateList() }
         if !listing.complete { bad.append(tab) }
         result[tab.lowercased()] = listing.rows.map(\.record)
-        prev = sourceRows().map(\.text)
     }
     result["coverage"] = ["scope": "full_list", "complete": bad.isEmpty]
     result["incomplete"] = bad
@@ -1056,9 +1348,16 @@ default:
     do {
         result = try withUILock {
             try prepare()
-            return mode == "detail"
-                ? ["fetched_at": iso.string(from: Date()), "detail": detail(detailName)]
-                : snapshot(mode == "all" ? TABS : TABS.filter { $0.lowercased() == mode })
+            guard mode == "detail" else {
+                return snapshot(mode == "all" ? TABS : TABS.filter { $0.lowercased() == mode })
+            }
+            let found = detail(detailName)
+            var read: [String: Any] = ["fetched_at": iso.string(from: Date()), "detail": found]
+            if let incomplete = found["incomplete"] as? [String] {
+                read["incomplete"] = incomplete
+                warn("could not prove every row was read in tab(s): \(incomplete.joined(separator: ", "))")
+            }
+            return read
         }
     } catch { let f = error as! Failure; die(f.message, f.code) }
 }
@@ -1072,6 +1371,9 @@ if wantText {
         if let a = d["address"] as? String { print("  address: \(a)") }
         if let la = d["latitude"] as? Double, let lo = d["longitude"] as? Double {
             print("  coords:  \(la), \(lo)")
+        }
+        if let zone = d["time_zone"] as? [String: Any] {
+            print("  timezone: \(timeZoneText(zone))")
         }
         if let e = d["error"] as? String { print("  error:   \(e)") }
     } else {
