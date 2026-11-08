@@ -139,47 +139,61 @@ func sourceHandleKey(_ label: String) -> String? {
     return SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
-/// Only fields belonging to one native row may be assembled. Expanded AX
-/// trees expose title, subtitle and distance separately from the compact label.
-func matchingRows(_ labels: [String], query: String) -> [Int] {
+/// Indices of the rows whose name matches `query`: exact names first, else a
+/// unique-or-not name prefix. Only names match, never places or ages.
+func matchingRows(_ names: [String], query: String) -> [Int] {
     let key = norm(query)
     guard !key.isEmpty else { return [] }
-    let names = labels.map { norm(rowIdentity($0)) }
+    let names = names.map(norm)
     let exact = names.indices.filter { names[$0] == key }
     return exact.isEmpty ? names.indices.filter { names[$0].hasPrefix(key) } : exact
 }
 
-/// A detail lookup over one tab's labels. Only a list proven complete can say
-/// an entry is absent (moving on to the next tab) or unique.
+/// A detail lookup over one tab's row names. Only a list proven complete can
+/// say an entry is absent (moving on to the next tab) or unique.
 enum Lookup: Equatable { case found(Int), absent, ambiguous, unproven }
-func lookup(_ labels: [String], complete: Bool, query: String) -> Lookup {
+func lookup(_ names: [String], complete: Bool, query: String) -> Lookup {
     guard complete else { return .unproven }
-    let matches = matchingRows(labels, query: query)
+    let matches = matchingRows(names, query: query)
     if matches.count > 1 { return .ambiguous }
     return matches.first.map { .found($0) } ?? .absent
 }
 
+/// Which generation of Find My's list is on screen. It is read once from the
+/// tree when the UI becomes readable, and decides how rows are found, parsed,
+/// paged and opened; nothing guesses it from a label's text.
+enum Layout {
+    /// Before Find My 5: `HomeElementCell` groups with comma-joined labels.
+    case legacy
+    /// Find My 5 (macOS 27): `ListEntityRow` buttons with " · "-joined labels.
+    case v5
+
+    func parse(_ label: String) -> [String: Any] {
+        switch self {
+        case .legacy: return parseCommas(label)
+        case .v5: return parseDotted(label)
+        }
+    }
+}
+
+/// Only fields belonging to one native row may be assembled. Expanded AX
+/// trees expose title, subtitle and distance separately from the compact label.
 func rowText(_ fields: [String: String]) -> String? {
-    if let entity = fields["ListEntityRow"], !entity.isEmpty { return entity }
     if let compact = fields["HomeElementCell"], !compact.isEmpty { return compact }
     guard let title = fields["HomeCellTitleLabel"], !title.isEmpty else { return nil }
     return [title, fields["HomeCellSubtitleLabel"], fields["HomeCellDistance"]]
         .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ", ")
 }
 
-/// Find My 5 (macOS 27) joins a row's fields with "\u{00A0}· ", distance before
-/// place: "Jane Doe · 31 mi · San Francisco, CA · 7 min. ago". A bare middle dot
-/// is not a separator ("Paral·lel").
-let dottedSeparator = #"\s\x{00B7}\s"#
-func dottedFields(_ raw: String) -> [String]? {
-    guard raw.range(of: dottedSeparator, options: .regularExpression) != nil else { return nil }
-    return raw.replacingOccurrences(of: dottedSeparator, with: "\u{1F}", options: .regularExpression)
-        .components(separatedBy: "\u{1F}").map { $0.trimmingCharacters(in: .whitespaces) }
-}
+/// Find My 5 joins a row's fields with exactly "\u{00A0}· ", distance before
+/// place: "Jane Doe · 31 mi · San Francisco, CA · 7 min. ago". Any other
+/// separator leaves the whole label as the name, a visibly wrong row.
+let dottedSeparator = "\u{00A0}\u{00B7} "
 
 /// Any field but the name can be missing, so the others are told apart by shape.
-func parseDotted(_ raw: String, _ fields: [String]) -> [String: Any] {
+func parseDotted(_ raw: String) -> [String: Any] {
     var row: [String: Any] = ["raw": raw]
+    let fields = raw.components(separatedBy: dottedSeparator).map { $0.trimmingCharacters(in: .whitespaces) }
     let name = fields[0]
     row["name"] = name
     if let key = sourceHandleKey(name) { row["source_handle_key"] = key }
@@ -217,8 +231,7 @@ func setLocation(_ row: inout [String: Any], _ loc: String) {
     }
 }
 
-func parse(_ raw: String) -> [String: Any] {
-    if let fields = dottedFields(raw) { return parseDotted(raw, fields) }
+func parseCommas(_ raw: String) -> [String: Any] {
     var row: [String: Any] = ["raw": raw]
     var text = raw
     if let m = distTailRE.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)) {
@@ -244,17 +257,13 @@ func parse(_ raw: String) -> [String: Any] {
 
 /// Collection identity/time describe this actual AX read, not a sensor fix.
 /// Serialize the same check without renewing its evidence or inventing tst.
-func sourceCheck(raw: String, fields: [String: String], checkedAt: Date, id: String) -> [String: Any] {
-    var value = parse(raw)
+func sourceCheck(_ parsed: [String: Any], fields: [String: String], checkedAt: Date, id: String) -> [String: Any] {
+    var value = parsed
     value["raw_fields"] = fields
     value["source_check_id"] = id
     value["checked_at"] = ISO8601DateFormatter().string(from: checkedAt)
     return value
 }
-
-/// A row's stable identity across reads: its title. `when`/`distance` text
-/// changes between reads, the title does not.
-func rowIdentity(_ raw: String) -> String { parse(raw)["name"] as? String ?? "" }
 
 /// Continue an enumerated sequence with one scrolled page. The page must start
 /// with a suffix of the sequence (overlap proves no row was skipped) and add
@@ -353,19 +362,18 @@ if wantSelftest {
         ("Ada Roe, San Francisco, CA , 7 min. ago, 31 mi", "Ada Roe", "San Francisco, CA", "7 min. ago", "31 mi"),
     ]
     for (raw, name, loc, when, dist) in cases {
-        let r = parse(raw)
+        let r = parseCommas(raw)
         assert(r["name"] as? String == name, "name: \(raw) -> \(r)")
         assert(r["location"] as? String == (["Address Unavailable", "No location found"].contains(loc ?? "") ? nil : loc), "location: \(raw) -> \(r)")
         assert(r["when"] as? String == when, "when: \(raw) -> \(r)")
         assert(r["distance"] as? String == dist, "distance: \(raw) -> \(r)")
     }
-    let candidates = ["<person-1>, City 1, Now", "<person-12>, City 2, Now"]
+    let candidates = ["<person-1>", "<person-12>"]
     assert(matchingRows(candidates, query: "<person-") == [0, 1])
     assert(matchingRows(candidates, query: "<person-1>") == [0])
     assert(matchingRows(candidates, query: "") == [])
-    assert(matchingRows(candidates, query: "City 1") == [])
     // A lookup decides only over a whole, proven list.
-    let listed = ["<person-1>, City 1, Now", "<person-2>, City 2, Now", "<person-23>, City 3, Now"]
+    let listed = ["<person-1>", "<person-2>", "<person-23>"]
     assert(lookup(listed, complete: true, query: "<person-23>") == .found(2))
     assert(lookup(listed, complete: true, query: "<person-9>") == .absent)
     assert(lookup(listed, complete: true, query: "<person-2") == .ambiguous)
@@ -375,8 +383,8 @@ if wantSelftest {
     assert(compact == "<person-1>, City 1, Region 1, Now, 5 mi")
     let expanded = rowText(["HomeCellTitleLabel":"+12025550101", "HomeCellSubtitleLabel":"City 1, Region 1, Now", "HomeCellDistance":"5 mi"])
     assert(expanded == "+12025550101, City 1, Region 1, Now, 5 mi")
-    assert(parse(expanded!)["name"] as? String == "+12025550101")
-    assert(parse(expanded!)["location"] as? String == "City 1, Region 1")
+    assert(parseCommas(expanded!)["name"] as? String == "+12025550101")
+    assert(parseCommas(expanded!)["location"] as? String == "City 1, Region 1")
     assert(rowText(["HomeCellSubtitleLabel":"City 1, Region 1, Now"]) == nil)
     assert(rowText(["UnrelatedPane":"<person-1>, City 1, Now"]) == nil)
     // Native handles can be keyed without turning a display name into identity.
@@ -388,58 +396,60 @@ if wantSelftest {
     assert(sourceHandleKey("person-1@EXAMPLE.invalid") == sourceHandleKey("person-1@example.invalid"))
     assert(sourceHandleKey("Person-1@example.invalid") != sourceHandleKey("person-1@example.invalid"))
     assert(sourceHandleKey("person-1@example.invalid")?.count == 64)
-    assert(parse("+1 (202) 555-0101, City 1, Region 1, Now")["source_handle_key"] as? String == sourceHandleKey("+12025550101"))
-    let paused = parse("Person 1, City 1, Region 1 , Paused, 10 mi")
+    assert(parseCommas("+1 (202) 555-0101, City 1, Region 1, Now")["source_handle_key"] as? String == sourceHandleKey("+12025550101"))
+    let paused = parseCommas("Person 1, City 1, Region 1 , Paused, 10 mi")
     assert(paused["location"] as? String == "City 1, Region 1")
     assert(paused["source_state"] as? String == "paused")
     assert(paused["when"] == nil)
     // People who see your location but share none of theirs are not a location.
-    let notShared = parse("Person 6, Can see your location")
+    let notShared = parseCommas("Person 6, Can see your location")
     assert(notShared["source_state"] as? String == "not_shared" && notShared["location"] == nil)
     // A friend still being located has no place yet.
     for locating in ["Person 9, Locating\u{2026}", "Person 9, Locating..."] {
-        assert(parse(locating)["source_state"] as? String == "unknown" && parse(locating)["location"] == nil)
+        assert(parseCommas(locating)["source_state"] as? String == "unknown" && parseCommas(locating)["location"] == nil)
     }
-    let unavailable = parse("Person 2, No location found")
+    let unavailable = parseCommas("Person 2, No location found")
     assert(unavailable["source_state"] as? String == "unavailable")
     assert(unavailable["location"] == nil)
     // Thousands separators belong to the distance, not to the place.
-    let far = parse("Person 7, City 7, ST , Paused, 2,470 mi")
+    let far = parseCommas("Person 7, City 7, ST , Paused, 2,470 mi")
     assert(far["distance"] as? String == "2,470 mi" && far["location"] as? String == "City 7, ST")
     assert(far["source_state"] as? String == "paused")
-    let farLive = parse("Person 8, City 8, ST , Now, 1,089 mi")
+    let farLive = parseCommas("Person 8, City 8, ST , Now, 1,089 mi")
     assert(farLive["when"] as? String == "Now" && farLive["location"] as? String == "City 8, ST")
-    let live = parse("Person 3, City 2, Region 2 , Now, 5 mi")
+    let live = parseCommas("Person 3, City 2, Region 2 , Now, 5 mi")
     assert(live["source_state"] as? String == "available")
     // Find My 5: one "\u{00A0}· "-joined label, distance before place.
     let dot = "\u{00A0}\u{00B7} "
-    let dotted = parse("Person 1\(dot)1,710 mi\(dot)City 1, ST\(dot)4 min. ago")
+    let dotted = parseDotted("Person 1\(dot)1,710 mi\(dot)City 1, ST\(dot)4 min. ago")
     assert(dotted["name"] as? String == "Person 1" && dotted["distance"] as? String == "1,710 mi")
     assert(dotted["location"] as? String == "City 1, ST" && dotted["when"] as? String == "4 min. ago")
     assert(dotted["source_state"] as? String == "available")
-    let nearby = parse("Person 2\(dot)Nearby\(dot)Place 2\(dot)Now")
+    let nearby = parseDotted("Person 2\(dot)Nearby\(dot)Place 2\(dot)Now")
     assert(nearby["distance"] as? String == "Nearby" && nearby["location"] as? String == "Place 2")
-    let abroad = parse("Person 3\(dot)6,938 mi\(dot)City 3, Region 3, Country 3\(dot)4 min. ago")
+    let abroad = parseDotted("Person 3\(dot)6,938 mi\(dot)City 3, Region 3, Country 3\(dot)4 min. ago")
     assert(abroad["location"] as? String == "City 3, Region 3, Country 3")
-    let noAddress = parse("Person 4\(dot)335 mi\(dot)Address unavailable\(dot)5 min. ago")
+    let noAddress = parseDotted("Person 4\(dot)335 mi\(dot)Address unavailable\(dot)5 min. ago")
     assert(noAddress["source_state"] as? String == "unavailable" && noAddress["location"] == nil)
     assert(noAddress["when"] as? String == "5 min. ago")
     for lost in ["Person 5\(dot)No Location Found", "Person 5\(dot)No location found"] {
-        assert(parse(lost)["source_state"] as? String == "unavailable" && parse(lost)["location"] == nil)
+        assert(parseDotted(lost)["source_state"] as? String == "unavailable" && parseDotted(lost)["location"] == nil)
     }
-    let dottedPaused = parse("Person 6\(dot)10 mi\(dot)City 6, ST\(dot)Paused")
+    let dottedPaused = parseDotted("Person 6\(dot)10 mi\(dot)City 6, ST\(dot)Paused")
     assert(dottedPaused["source_state"] as? String == "paused" && dottedPaused["location"] as? String == "City 6, ST")
-    assert(parse("Person 7\(dot)Can see your location")["source_state"] as? String == "not_shared")
-    assert(parse("Person 8\(dot)Paral\u{00B7}lel, City 8")["location"] as? String == "Paral\u{00B7}lel, City 8")
-    let sharedItem = parse("Item 1\(dot)Nearby\(dot)Home\(dot)8 min. ago\(dot)Shared with Person 1 and 1 more")
+    assert(parseDotted("Person 7\(dot)Can see your location")["source_state"] as? String == "not_shared")
+    assert(parseDotted("Person 8\(dot)Paral\u{00B7}lel, City 8")["location"] as? String == "Paral\u{00B7}lel, City 8")
+    let sharedItem = parseDotted("Item 1\(dot)Nearby\(dot)Home\(dot)8 min. ago\(dot)Shared with Person 1 and 1 more")
     assert(sharedItem["location"] as? String == "Home" && sharedItem["shared"] as? String == "Shared with Person 1 and 1 more")
-    let dottedHandle = parse("+1 (202) 555-0101\(dot)5 mi\(dot)City 1, ST\(dot)Now")
+    let dottedHandle = parseDotted("+1 (202) 555-0101\(dot)5 mi\(dot)City 1, ST\(dot)Now")
     assert(dottedHandle["source_handle_key"] as? String == sourceHandleKey("+12025550101"))
-    assert(rowText(["ListEntityRow": "Person 1\(dot)City 1"]) == "Person 1\(dot)City 1")
-    assert(rowIdentity("Person 1\(dot)5 mi\(dot)City 1, ST\(dot)Now") == "Person 1")
-    assert(matchingRows(["Person 1\(dot)5 mi\(dot)City 1, ST", "Person 12\(dot)City 2"], query: "Person 1") == [0])
+    // A changed separator is a visibly wrong row, never a comma-parsed guess.
+    let respaced = parseDotted("Person 1 \u{00B7} 5 mi \u{00B7} City 1, ST")
+    assert(respaced["name"] as? String == "Person 1 \u{00B7} 5 mi \u{00B7} City 1, ST" && respaced["location"] == nil)
+    assert(Layout.v5.parse("Person 1\(dot)City 1")["name"] as? String == "Person 1")
+    assert(Layout.legacy.parse("Person 1\(dot)City 1, ST")["location"] as? String == "ST")
     let collected = Date(timeIntervalSince1970: 1_800_000_000)
-    let check = sourceCheck(raw: "<person-1>, City 1, Now", fields: ["HomeElementCell":"<person-1>, City 1, Now"],
+    let check = sourceCheck(parseCommas("<person-1>, City 1, Now"), fields: ["HomeElementCell":"<person-1>, City 1, Now"],
                             checkedAt: collected, id: "example-check-1")
     assert(check["source_check_id"] as? String == "example-check-1")
     assert(check["checked_at"] as? String == "2027-01-15T08:00:00Z")
@@ -454,7 +464,7 @@ if wantSelftest {
     assert(mergePage(["a", "b", "c"], ["c", "b", "d"]) == nil)       // reordered while scrolling
     assert(mergePage(["a", "b"], ["b", "b"]) == nil)                 // ambiguous identity
     assert(mergePage(["a"], ["a", "c", "c"]) == nil && mergePage([], ["a", "a"]) == nil)
-    assert(rowIdentity("+1 (202) 555-0101, City 1, ST , 2 min. ago, 5 mi") == "+1 (202) 555-0101")
+    assert(parseCommas("+1 (202) 555-0101, City 1, ST , 2 min. ago, 5 mi")["name"] as? String == "+1 (202) 555-0101")
     // Displayed age: exact units only, never a guessed fix time.
     assert(ageSeconds("Now") == 0)
     assert(ageSeconds("7 min. ago") == 420)
@@ -472,13 +482,13 @@ if wantSelftest {
     let k1 = sourceHandleKey("+12025550101")!, k2 = sourceHandleKey("+12025550102")!
     let at = Date(timeIntervalSince1970: 1_800_000_000)
     let rows: [[String: Any]] = [
-        sourceCheck(raw: "Me, City 1, ST", fields: [:], checkedAt: at, id: "c0"),
-        sourceCheck(raw: "+1 (202) 555-0101, City 1, ST , 7 min. ago, 5 mi", fields: [:], checkedAt: at, id: "c1"),
-        sourceCheck(raw: "+1 (202) 555-0102, City 2, ST , Now, 9 mi", fields: [:], checkedAt: at, id: "c2"),
-        sourceCheck(raw: "<person-3>, City 3, ST , Now, 9 mi", fields: [:], checkedAt: at, id: "c3"),
-        sourceCheck(raw: "person-4@example.invalid, City 4, ST , Paused, 1 mi", fields: [:], checkedAt: at, id: "c4"),
-        sourceCheck(raw: "+1 (202) 555-0105, No location found", fields: [:], checkedAt: at, id: "c5"),
-        sourceCheck(raw: "+1 (202) 555-0106, Can see your location", fields: [:], checkedAt: at, id: "c6"),
+        sourceCheck(parseCommas("Me, City 1, ST"), fields: [:], checkedAt: at, id: "c0"),
+        sourceCheck(parseCommas("+1 (202) 555-0101, City 1, ST , 7 min. ago, 5 mi"), fields: [:], checkedAt: at, id: "c1"),
+        sourceCheck(parseCommas("+1 (202) 555-0102, City 2, ST , Now, 9 mi"), fields: [:], checkedAt: at, id: "c2"),
+        sourceCheck(parseCommas("<person-3>, City 3, ST , Now, 9 mi"), fields: [:], checkedAt: at, id: "c3"),
+        sourceCheck(parseCommas("person-4@example.invalid, City 4, ST , Paused, 1 mi"), fields: [:], checkedAt: at, id: "c4"),
+        sourceCheck(parseCommas("+1 (202) 555-0105, No location found"), fields: [:], checkedAt: at, id: "c5"),
+        sourceCheck(parseCommas("+1 (202) 555-0106, Can see your location"), fields: [:], checkedAt: at, id: "c6"),
     ]
     let map = [k1: "person-a", sourceHandleKey("person-4@example.invalid")!: "person-b",
                sourceHandleKey("+12025550105")!: "person-c"]
@@ -603,15 +613,37 @@ func listContainer() -> AXUIElement? {
     return siblings.first { sattr($0, "AXRole") != "AXTabGroup" }
 }
 
+/// One row as read: its label parsed by the layout it was read from, and the
+/// identity and time of this read.
 struct SourceRow {
     let element: AXUIElement
     let fields: [String: String]
     let text: String
-    let checkedAt: Date
-    let checkID: String
-    var record: [String: Any] {
-        sourceCheck(raw: text, fields: fields, checkedAt: checkedAt, id: checkID)
+    let parsed: [String: Any]
+    let checkedAt = Date()
+    let checkID = UUID().uuidString.lowercased()
+
+    init(_ element: AXUIElement, fields: [String: String], text: String) {
+        self.element = element
+        self.fields = fields
+        self.text = text
+        parsed = layout.parse(text)
     }
+
+    /// A row's stable identity across reads: its name. `when`/`distance` text
+    /// changes between reads, the name does not.
+    var name: String { parsed["name"] as? String ?? "" }
+    var record: [String: Any] { sourceCheck(parsed, fields: fields, checkedAt: checkedAt, id: checkID) }
+}
+
+/// Set by `waitReady` from the tree before any row is read.
+var layout = Layout.legacy
+
+/// The layout whose rows the list shows; nil while it shows none.
+func detectLayout() -> Layout? {
+    guard let root = listContainer() else { return nil }
+    if !entityRows(root).isEmpty { return .v5 }
+    return legacyCells(root).isEmpty ? nil : .legacy
 }
 
 /// Find My 5 rows: one AXButton per row whose description is the whole label.
@@ -621,43 +653,51 @@ func entityRows(_ root: AXUIElement) -> [AXUIElement] {
     return rows
 }
 
+func legacyCells(_ root: AXUIElement) -> [AXUIElement] {
+    var cells: [AXUIElement] = []
+    findAll(root, { sattr($0, "AXIdentifier") == "HomeElementCell" && sattr($0, "AXRole") == "AXGroup" }, &cells)
+    return cells
+}
+
 func ancestry(_ el: AXUIElement, upTo root: AXUIElement) -> [AXUIElement] {
     var chain = [el]
     while !CFEqual(chain.last!, root), let parent = attr(chain.last!, "AXParent") { chain.append(parent as! AXUIElement) }
     return chain
 }
 
-/// What pages the list and frames its rows. Find My 5 nests it inside the
-/// container, as the rows' nearest common ancestor; its page actions come and
-/// go with the scroll position, so they cannot pick it. Older versions page the
-/// container itself. With no rendered row (an empty or loading list) or a lone
-/// Find My 5 row, nothing here proves an edge.
+/// What pages the list and frames its rows. Before Find My 5, the container
+/// itself. Find My 5 nests it inside the container, as the rows' nearest common
+/// ancestor; its page actions come and go with the scroll position, so they
+/// cannot pick it. With no rendered row (an empty or loading list) or a lone
+/// row, nothing here proves an edge.
 func scrollList() -> AXUIElement? {
     guard let root = listContainer() else { return nil }
-    let rows = entityRows(root)
-    guard let first = rows.first, let last = rows.last else {
-        var cells: [AXUIElement] = []
-        findAll(root, { sattr($0, "AXIdentifier") == "HomeElementCell" }, &cells)
-        return cells.isEmpty ? nil : root
+    switch layout {
+    case .legacy:
+        return root
+    case .v5:
+        let rows = entityRows(root)
+        guard let first = rows.first, let last = rows.last else { return nil }
+        let lastChain = ancestry(last, upTo: root)
+        return ancestry(first, upTo: root).first { a in lastChain.contains { CFEqual($0, a) } }
     }
-    let lastChain = ancestry(last, upTo: root)
-    return ancestry(first, upTo: root).first { a in lastChain.contains { CFEqual($0, a) } }
 }
 
 func sourceRows() -> [SourceRow] {
     guard let root = listContainer() else { return [] }
-    let entities = entityRows(root)
-    if !entities.isEmpty {
-        return entities.compactMap { row in
-            let fields = ["ListEntityRow": sattr(row, "AXDescription") ?? ""]
-            guard let text = rowText(fields) else { return nil }
-            return SourceRow(element: row, fields: fields, text: text,
-                             checkedAt: Date(), checkID: UUID().uuidString.lowercased())
+    switch layout {
+    case .legacy:
+        return legacyRows(root)
+    case .v5:
+        return entityRows(root).compactMap { row in
+            guard let text = sattr(row, "AXDescription"), !text.isEmpty else { return nil }
+            return SourceRow(row, fields: ["ListEntityRow": text], text: text)
         }
     }
-    var cells: [AXUIElement] = []
-    findAll(root, { sattr($0, "AXIdentifier") == "HomeElementCell" && sattr($0, "AXRole") == "AXGroup" }, &cells)
-    return cells.compactMap { cell in
+}
+
+func legacyRows(_ root: AXUIElement) -> [SourceRow] {
+    legacyCells(root).compactMap { cell in
         var texts: [AXUIElement] = []
         findAll(cell, { sattr($0, "AXRole") == "AXStaticText" }, &texts)
         var fields: [String: String] = [:]
@@ -671,8 +711,7 @@ func sourceRows() -> [SourceRow] {
             if key == "HomeElementCell" { compact = text }
         }
         guard let text = rowText(fields) else { return nil }
-        return SourceRow(element: compact ?? cell, fields: fields, text: text,
-                         checkedAt: Date(), checkID: UUID().uuidString.lowercased())
+        return SourceRow(compact ?? cell, fields: fields, text: text)
     }
 }
 
@@ -736,7 +775,10 @@ func waitReady(timeout: TimeInterval) -> Bool {
         refreshAX()
         ensureWindow()
         declineNotificationSheet()
-        if !tabButtons().isEmpty && rowStrings().count > TABS.count { return true }
+        if !tabButtons().isEmpty, let shown = detectLayout() {
+            layout = shown
+            if rowStrings().count > TABS.count { return true }
+        }
         Thread.sleep(forTimeInterval: 0.5)
     }
     return false
@@ -815,7 +857,7 @@ func restoreTab(_ original: String?) {
 
 /// Share of visible located rows showing "Paused".
 func pausedShare(_ rows: [SourceRow]) -> Double {
-    let located = rows.map { parse($0.text) }.filter { $0["location"] != nil }
+    let located = rows.map(\.parsed).filter { $0["location"] != nil }
     guard !located.isEmpty else { return 0 }
     return Double(located.filter { $0["source_state"] as? String == "paused" }.count) / Double(located.count)
 }
@@ -831,7 +873,7 @@ func wakeIfPaused() {
     // Un-paused rows show no age for a second or two; wait for real ages, then
     // stay active a little longer so updates keep flowing once focus returns.
     func live(_ rows: [SourceRow]) -> Bool {
-        pausedShare(rows) < 0.5 && rows.contains { parse($0.text)["when"] != nil }
+        pausedShare(rows) < 0.5 && rows.contains { $0.parsed["when"] != nil }
     }
     let deadline = Date().addingTimeInterval(20)
     repeat { Thread.sleep(forTimeInterval: 0.5) } while Date() < deadline && !live(sourceRows())
@@ -849,7 +891,7 @@ func wakeIfPaused() {
 // the sequence until two scrolls in a row add nothing. Every page must overlap
 // the previous one in order, so a skipped or reordered row fails closed.
 
-func identities(_ rows: [SourceRow]) -> [String] { rows.map { rowIdentity($0.text) } }
+func identities(_ rows: [SourceRow]) -> [String] { rows.map(\.name) }
 
 /// Read until three consecutive reads, 0.3 s apart, agree on the visible rows.
 func settledRows() -> [SourceRow] {
@@ -932,7 +974,7 @@ func enumerateList(maxPages: Int = 100) -> (rows: [SourceRow], complete: Bool) {
         }
         idle = 0
         sequence += added
-        rows += next.filter { added.contains(rowIdentity($0.text)) }
+        rows += next.filter { added.contains($0.name) }
     }
     return (rows, false)
 }
@@ -1010,10 +1052,10 @@ func geocode(_ address: String) -> (latitude: Double, longitude: Double, timeZon
 func locateRow(_ query: String) -> (decision: Lookup, row: SourceRow?) {
     var listing = enumerateList()
     if !listing.complete { listing = enumerateList() }
-    let decision = lookup(listing.rows.map(\.text), complete: listing.complete, query: query)
+    let decision = lookup(listing.rows.map(\.name), complete: listing.complete, query: query)
     guard case .found(let index) = decision else { return (decision, nil) }
-    let target = rowIdentity(listing.rows[index].text)
-    func onPage() -> SourceRow? { settledRows().first { rowIdentity($0.text) == target } }
+    let target = listing.rows[index].name
+    func onPage() -> SourceRow? { settledRows().first { $0.name == target } }
     if let row = onPage() { return (decision, row) }
     guard scrollToTop(maxPages: 100) != nil else { return (.unproven, nil) }
     for _ in 0..<100 {
@@ -1060,7 +1102,11 @@ func detail(_ name: String) -> [String: Any] {
     }
     out["row"] = row.record
 
-    let pane = row.fields["ListEntityRow"] != nil ? detailSheet(rowIdentity(row.text)) : detailPopover(row)
+    let pane: DetailPane
+    switch layout {
+    case .legacy: pane = detailPopover(row)
+    case .v5: pane = detailSheet(row.name)
+    }
     if let error = pane.error {
         out["error"] = error
         return out
@@ -1133,7 +1179,7 @@ func detailPopover(_ row: SourceRow) -> DetailPane {
 /// The one on-screen Find My 5 row titled exactly `name`.
 func entityRow(named name: String) -> AXUIElement? {
     guard let root = listContainer() else { return nil }
-    let matches = entityRows(root).filter { rowIdentity(sattr($0, "AXDescription") ?? "") == name }
+    let matches = entityRows(root).filter { parseDotted(sattr($0, "AXDescription") ?? "")["name"] as? String == name }
     return matches.count == 1 ? matches[0] : nil
 }
 
